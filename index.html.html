@@ -1,0 +1,326 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Экстренный вызов по наклону головы</title>
+    <script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/face_mesh/face_mesh.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/camera_utils/camera_utils.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/drawing_utils/drawing_utils.js"></script> <!-- Для рисования контуров -->
+    <style>
+        body {
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            font-family: sans-serif;
+            margin-top: 10px;
+            text-align: center;
+        }
+        #mainCanvas {
+            border: 1px solid black;
+            margin-bottom: 10px;
+        }
+        #snapshotCanvas {
+            border: 1px solid grey;
+            margin-top: 10px; /* Отступ сверху для снимка */
+        }
+        #status {
+            margin-top: 5px;
+            font-size: 1.1em;
+            min-height: 2.8em; /* Увеличено для потенциально двух строк */
+            max-width: 90%;
+            line-height: 1.4; /* Для лучшей читаемости многострочного текста */
+        }
+        .emergency-call {
+            color: red;
+            font-weight: bold;
+            font-size: 1.3em;
+        }
+        .info-prompt {
+            color: navy; /* Для информационных сообщений после вызова */
+            font-weight: bold;
+        }
+        h1 {
+            font-size: 1.3em;
+            margin-bottom: 10px;
+        }
+        button {
+            padding: 8px 15px;
+            font-size: 1em;
+            /* margin-bottom: 10px; убрал, т.к. status ниже */
+        }
+    </style>
+</head>
+<body>
+    <h1>После калибровки для совершения экстренного вызова наклоните голову</h1>
+    <video id="video" autoplay playsinline width="320" height="240" style="display:none;"></video>
+    <canvas id="mainCanvas" width="320" height="240"></canvas>
+    <button id="startButton">Включить камеру и откалибровать</button>
+    <p id="status">Нажмите "Включить камеру и откалибровать" для начала.</p>
+    <canvas id="snapshotCanvas" width="320" height="240" style="display:none;"></canvas>
+
+    <script>
+        const videoElement = document.getElementById('video');
+        const mainCanvasElement = document.getElementById('mainCanvas');
+        const statusElement = document.getElementById('status');
+        const startButton = document.getElementById('startButton');
+        const mainCtx = mainCanvasElement.getContext('2d');
+
+        const snapshotCanvasElement = document.getElementById('snapshotCanvas');
+        const snapshotCtx = snapshotCanvasElement.getContext('2d');
+
+        let neutralTiltX = 0;
+        let neutralTiltY = 0;
+        let isCalibrated = false;
+        let calibrationFrames = 0;
+        const CALIBRATION_FRAMES_COUNT = 75; // ~2.5 секунды при 30 FPS
+        let accumulatedTiltX = 0;
+        let accumulatedTiltY = 0;
+        
+        let callMade = false; // Флаг первого вызова
+        let promptedForSecondTilt = false; // Флаг, что выведено сообщение о втором наклоне
+        let secondTiltActionDone = false; // Флаг, что второй наклон выполнен и снимок сделан
+
+        async function setupCamera() {
+            try {
+                const stream = await navigator.mediaDevices.getUserMedia({ video: { width: 320, height: 240 } });
+                videoElement.srcObject = stream;
+                await new Promise((resolve) => {
+                    videoElement.onloadedmetadata = () => resolve(videoElement);
+                });
+                statusElement.textContent = "Камера включена. Начинается калибровка...";
+                statusElement.className = '';
+                return videoElement;
+            } catch (error) {
+                console.error("Ошибка при доступе к камере:", error);
+                statusElement.textContent = `Ошибка при доступе к камере: ${error.message}`;
+                statusElement.className = '';
+                throw error;
+            }
+        }
+
+        function calculateTilt(landmarks) {
+            const leftEye = landmarks[33];
+            const rightEye = landmarks[263];
+            const noseTip = landmarks[1];
+
+            if (!leftEye || !rightEye || !noseTip) return { tiltX: 0, tiltY: 0 };
+            
+            const eyeCenterX = (leftEye.x + rightEye.x) / 2;
+            const eyeCenterY = (leftEye.y + rightEye.y) / 2;
+            const eyeDistanceHorizontal = Math.abs(rightEye.x - leftEye.x);
+
+            if (eyeDistanceHorizontal < 0.01) return { tiltX: 0, tiltY: 0 };
+
+            const noseOffsetX = noseTip.x - eyeCenterX;
+            const noseOffsetY = noseTip.y - eyeCenterY;
+            const tiltX = noseOffsetX / eyeDistanceHorizontal;
+            const tiltY = noseOffsetY / eyeDistanceHorizontal;
+            return { tiltX, tiltY };
+        }
+
+        function drawVideoOnMainCanvas() {
+            mainCtx.clearRect(0, 0, mainCanvasElement.width, mainCanvasElement.height);
+            mainCtx.drawImage(videoElement, 0, 0, mainCanvasElement.width, mainCanvasElement.height);
+        }
+
+        function takeAndProcessSnapshot(landmarks) {
+            if (!landmarks || landmarks.length === 0) return;
+
+            snapshotCtx.clearRect(0,0,snapshotCanvasElement.width, snapshotCanvasElement.height);
+            // 1. Рисуем текущий кадр на snapshotCanvas
+            snapshotCtx.drawImage(videoElement, 0, 0, snapshotCanvasElement.width, snapshotCanvasElement.height);
+
+            // 2. Конвертируем в Ч/Б
+            const imageData = snapshotCtx.getImageData(0, 0, snapshotCanvasElement.width, snapshotCanvasElement.height);
+            const data = imageData.data;
+            for (let i = 0; i < data.length; i += 4) {
+                const avg = (data[i] + data[i + 1] + data[i + 2]) / 3;
+                data[i] = avg;     // Red
+                data[i + 1] = avg; // Green
+                data[i + 2] = avg; // Blue
+            }
+            snapshotCtx.putImageData(imageData, 0, 0);
+
+            // 3. Рисуем контуры MediaPipe (белым цветом)
+            // `landmarks` уже нормализованы (0-1) из FaceMesh
+            if (window.drawConnectors && window.FACEMESH_CONTOURS) { // Проверка наличия функций и констант
+                // Основные контуры лица
+                window.drawConnectors(snapshotCtx, landmarks, window.FACEMESH_CONTOURS, {color: '#FFFFFF', lineWidth: 1.5});
+                // Глаза
+                window.drawConnectors(snapshotCtx, landmarks, window.FACEMESH_LEFT_EYE, {color: '#FFFFFF', lineWidth: 1.5});
+                window.drawConnectors(snapshotCtx, landmarks, window.FACEMESH_RIGHT_EYE, {color: '#FFFFFF', lineWidth: 1.5});
+                // Брови
+                window.drawConnectors(snapshotCtx, landmarks, window.FACEMESH_LEFT_EYEBROW, {color: '#FFFFFF', lineWidth: 1.5});
+                window.drawConnectors(snapshotCtx, landmarks, window.FACEMESH_RIGHT_EYEBROW, {color: '#FFFFFF', lineWidth: 1.5});
+                // Губы
+                window.drawConnectors(snapshotCtx, landmarks, window.FACEMESH_LIPS, {color: '#FFFFFF', lineWidth: 1.5});
+                // Овал лица (если FACEMESH_FACE_OVAL доступен и нужен)
+                if (window.FACEMESH_FACE_OVAL) {
+                     window.drawConnectors(snapshotCtx, landmarks, window.FACEMESH_FACE_OVAL, {color: '#FFFFFF', lineWidth: 1.5});
+                }
+                // Тесселяция (может быть слишком шумно, но дает больше деталей)
+                // window.drawConnectors(snapshotCtx, landmarks, window.FACEMESH_TESSELATION, {color: '#E0E0E0', lineWidth: 0.5});
+            } else {
+                console.warn("MediaPipe drawing_utils или константы не загружены.");
+            }
+
+            snapshotCanvasElement.style.display = 'block';
+            secondTiltActionDone = true;
+            statusElement.textContent = "Данные для распознавания сформированы.";
+            statusElement.className = 'info-prompt'; // Используем тот же стиль для финального сообщения
+        }
+
+        function handleFirstCall() {
+            if (!callMade) {
+                statusElement.textContent = "ЭКСТРЕННЫЙ ВЫЗОВ СОВЕРШЁН";
+                statusElement.className = 'emergency-call';
+                // window.open("https://www.google.com", "_blank"); // Закомментировано для тестов
+                console.log('Экстренный вызов (симуляция)');
+                callMade = true;
+
+                setTimeout(() => {
+                    if (callMade && !promptedForSecondTilt && !secondTiltActionDone) { // Доп. проверки
+                        statusElement.textContent = "Для распознавания личности и передачи данных еще раз наклоните голову ВНИЗ.";
+                        statusElement.className = 'info-prompt';
+                        promptedForSecondTilt = true;
+                    }
+                }, 2500); // Задержка для прочтения первого сообщения
+            }
+        }
+
+        async function startFaceMesh() {
+            const faceMesh = new FaceMesh({
+                locateFile: (file) => `https://cdn.jsdelivr.net/npm/@mediapipe/face_mesh/${file}`
+            });
+            faceMesh.setOptions({ 
+                maxNumFaces: 1, 
+                refineLandmarks: true, // Важно для более точных контуров глаз, губ
+                minDetectionConfidence: 0.5, 
+                minTrackingConfidence: 0.5 
+            });
+            faceMesh.onResults(onResults);
+
+            try {
+                await setupCamera();
+            } catch (e) { return; }
+
+            const camera = new Camera(videoElement, {
+                onFrame: async () => {
+                    if (videoElement.readyState >= 2) { // Убедимся, что кадр доступен
+                       await faceMesh.send({ image: videoElement });
+                    }
+                },
+                width: 320,
+                height: 240
+            });
+            camera.start();
+        }
+
+        function onResults(results) {
+            drawVideoOnMainCanvas();
+
+            if (results.multiFaceLandmarks && results.multiFaceLandmarks.length > 0) {
+                const landmarks = results.multiFaceLandmarks[0];
+                const { tiltX: currentTiltX, tiltY: currentTiltY } = calculateTilt(landmarks);
+
+                if (!isCalibrated) {
+                    if (calibrationFrames < CALIBRATION_FRAMES_COUNT) {
+                        accumulatedTiltX += currentTiltX;
+                        accumulatedTiltY += currentTiltY;
+                        calibrationFrames++;
+                        statusElement.textContent = `Калибровка... Держите голову ровно (${calibrationFrames}/${CALIBRATION_FRAMES_COUNT})`;
+                        statusElement.className = '';
+                    } else {
+                        neutralTiltX = accumulatedTiltX / CALIBRATION_FRAMES_COUNT;
+                        neutralTiltY = accumulatedTiltY / CALIBRATION_FRAMES_COUNT;
+                        isCalibrated = true;
+                        statusElement.textContent = "Калибровка завершена. Для вызова наклоните голову.";
+                        statusElement.className = '';
+                        console.log(`Калибровка: neutralTiltX=${neutralTiltX.toFixed(3)}, neutralTiltY=${neutralTiltY.toFixed(3)}`);
+                    }
+                } else { // После калибровки
+                    const relativeTiltX = currentTiltX - neutralTiltX;
+                    const relativeTiltY = currentTiltY - neutralTiltY;
+                    const tiltThresholdSide = 0.25; 
+                    const tiltThresholdVertical = 0.25; 
+
+                    if (secondTiltActionDone) {
+                        // Если все действия выполнены, ничего не делаем, финальное сообщение уже стоит
+                        return;
+                    }
+
+                    if (!callMade) { // Этап 1: Ожидание первого наклона
+                        if (relativeTiltX > tiltThresholdSide || 
+                            relativeTiltX < -tiltThresholdSide ||
+                            relativeTiltY > tiltThresholdVertical ||
+                            relativeTiltY < -tiltThresholdVertical) {
+                            handleFirstCall();
+                        } else if (statusElement.className !== 'emergency-call') { // Не перезаписывать, если только что было красное
+                            statusElement.textContent = "Голова ровно. Для вызова наклоните голову.";
+                            statusElement.className = '';
+                        }
+                    } else if (promptedForSecondTilt && !secondTiltActionDone) { // Этап 2: Ожидание второго наклона (вниз)
+                        // ТОЛЬКО наклон вниз
+                        if (relativeTiltY > tiltThresholdVertical + 0.05) { // Чуть больший порог для второго наклона вниз для надежности
+                            takeAndProcessSnapshot(landmarks);
+                        } else if (statusElement.className !== 'emergency-call') { // Не перезаписывать, если только что было красное
+                            // Сообщение о необходимости наклона вниз уже должно быть установлено в handleFirstCall
+                            // Можно добавить напоминание, если голова выровнялась
+                            // statusElement.textContent = "Для распознавания личности и передачи данных еще раз наклоните голову ВНИЗ.";
+                            // statusElement.className = 'info-prompt';
+                        }
+                    }
+                }
+            } else { // Лицо не обнаружено
+                 if (secondTiltActionDone) return; // Если все сделано, не меняем статус
+
+                if (!isCalibrated) {
+                    statusElement.textContent = "Лицо не обнаружено для калибровки. Посмотрите в камеру.";
+                } else if (!callMade) {
+                    statusElement.textContent = "Лицо не обнаружено. Для вызова наклоните голову.";
+                } else if (promptedForSecondTilt && !secondTiltActionDone) {
+                     // Не меняем, если висит "ЭКСТРЕННЫЙ ВЫЗОВ" или "Для распознавания..."
+                    if (statusElement.className !== 'emergency-call' && statusElement.className !== 'info-prompt') {
+                        statusElement.textContent = "Лицо не обнаружено.";
+                    } else if (statusElement.className === 'info-prompt' && !statusElement.textContent.includes("ВНИЗ")) {
+                        // Если уже есть info-prompt, но не про наклон вниз, то можно обновить
+                         statusElement.textContent = "Лицо не обнаружено. Для распознавания наклоните голову ВНИЗ.";
+                    }
+                }
+                if (statusElement.className !== 'emergency-call' && statusElement.className !== 'info-prompt') {
+                  statusElement.className = '';
+                }
+            }
+        }
+
+        startButton.addEventListener('click', async () => {
+            startButton.style.display = 'none';
+            snapshotCanvasElement.style.display = 'none';
+            isCalibrated = false;
+            calibrationFrames = 0;
+            accumulatedTiltX = 0;
+            accumulatedTiltY = 0;
+            neutralTiltX = 0;
+            neutralTiltY = 0;
+            
+            callMade = false;
+            promptedForSecondTilt = false;
+            secondTiltActionDone = false;
+
+            statusElement.textContent = "Нажмите \"Включить камеру и откалибровать\" для начала.";
+            statusElement.className = '';
+
+            try {
+                await startFaceMesh();
+            } catch (error) {
+                console.error("Ошибка при запуске FaceMesh:", error);
+                statusElement.textContent = `Ошибка при запуске FaceMesh: ${error.message}`;
+                statusElement.className = '';
+                startButton.style.display = 'block';
+            }
+        });
+    </script>
+</body>
+</html>
